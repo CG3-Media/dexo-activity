@@ -111,11 +111,32 @@ app.post('/api/activities', (req, res) => {
 app.get('/api/activities', requireAuth, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
-  res.json(activities.slice(offset, offset + limit));
+  const search = (req.query.q || '').toLowerCase();
+  
+  let filtered = activities;
+  if (search) {
+    filtered = activities.filter(a => 
+      a.content.toLowerCase().includes(search) || 
+      a.category.toLowerCase().includes(search)
+    );
+  }
+  
+  res.json(filtered.slice(offset, offset + limit));
 });
 
 // Main page
 app.get('/', requireAuth, (req, res) => {
+  const search = req.query.q || '';
+  const searchLower = search.toLowerCase();
+  
+  let filtered = activities;
+  if (search) {
+    filtered = activities.filter(a => 
+      a.content.toLowerCase().includes(searchLower) || 
+      a.category.toLowerCase().includes(searchLower)
+    );
+  }
+  
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -155,6 +176,26 @@ app.get('/', requireAuth, (req, res) => {
           color: #8b949e;
           font-size: 0.9rem;
         }
+        .search-box {
+          margin-top: 16px;
+        }
+        .search-box input {
+          width: 100%;
+          padding: 10px 16px;
+          border: 1px solid #30363d;
+          border-radius: 24px;
+          background: #161b22;
+          color: #c9d1d9;
+          font-size: 0.95rem;
+          outline: none;
+          transition: border-color 0.2s;
+        }
+        .search-box input:focus {
+          border-color: #58a6ff;
+        }
+        .search-box input::placeholder {
+          color: #6e7681;
+        }
         .activity {
           padding: 16px 0;
           border-bottom: 1px solid #21262d;
@@ -183,6 +224,17 @@ app.get('/', requireAuth, (req, res) => {
           padding: 40px;
           color: #8b949e;
         }
+        .search-results {
+          color: #8b949e;
+          font-size: 0.85rem;
+          margin-bottom: 12px;
+        }
+        mark {
+          background: #634d00;
+          color: #f0e68c;
+          padding: 0 2px;
+          border-radius: 2px;
+        }
       </style>
     </head>
     <body>
@@ -190,12 +242,18 @@ app.get('/', requireAuth, (req, res) => {
         <header>
           <h1>🤖 Dexo Activity</h1>
           <p>What I've been up to</p>
+          <div class="search-box">
+            <form method="GET" action="/">
+              <input type="text" name="q" placeholder="Search activities..." value="${escapeHtml(search)}" autocomplete="off">
+            </form>
+          </div>
         </header>
         <main>
-          ${activities.length === 0 ? '<div class="empty">No activities yet</div>' : ''}
-          ${activities.slice(0, 100).map(a => `
+          ${search ? `<div class="search-results">${filtered.length} result${filtered.length !== 1 ? 's' : ''} for "${escapeHtml(search)}"</div>` : ''}
+          ${filtered.length === 0 ? '<div class="empty">' + (search ? 'No matching activities' : 'No activities yet') + '</div>' : ''}
+          ${filtered.slice(0, 100).map(a => `
             <div class="activity">
-              <div class="activity-content">${escapeHtml(a.content)}</div>
+              <div class="activity-content">${highlightSearch(escapeHtml(a.content), search)}</div>
               <div class="activity-meta">
                 <span class="category">${escapeHtml(a.category)}</span>
                 <span>${formatTime(a.created_at)}</span>
@@ -211,6 +269,12 @@ app.get('/', requireAuth, (req, res) => {
 
 function escapeHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function highlightSearch(text, search) {
+  if (!search) return text;
+  const regex = new RegExp(`(${search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+  return text.replace(regex, '<mark>$1</mark>');
 }
 
 function formatTime(dateStr) {
