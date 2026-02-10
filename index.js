@@ -1,21 +1,27 @@
 const express = require('express');
-const Database = require('better-sqlite3');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const APP_TOKEN = process.env.APP_TOKEN;
+const DATA_FILE = process.env.DATA_FILE || './activities.json';
 
-// Initialize SQLite database
-const db = new Database(process.env.DB_PATH || './activity.db');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS activities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content TEXT NOT NULL,
-    category TEXT DEFAULT 'general',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// Load activities from file
+function loadActivities() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveActivities(activities) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(activities, null, 2));
+}
+
+let activities = loadActivities();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -73,7 +79,7 @@ function requireAuth(req, res, next) {
   }
 }
 
-// API: Add activity (token in header for programmatic access)
+// API: Add activity
 app.post('/api/activities', (req, res) => {
   const authHeader = req.headers.authorization;
   const cookieAuth = req.cookies.app_token === APP_TOKEN;
@@ -88,34 +94,28 @@ app.post('/api/activities', (req, res) => {
     return res.status(400).json({ error: 'Content required' });
   }
   
-  const stmt = db.prepare('INSERT INTO activities (content, category) VALUES (?, ?)');
-  const result = stmt.run(content, category || 'general');
+  const activity = {
+    id: Date.now(),
+    content,
+    category: category || 'general',
+    created_at: new Date().toISOString()
+  };
   
-  res.json({ id: result.lastInsertRowid, content, category: category || 'general' });
+  activities.unshift(activity);
+  saveActivities(activities);
+  
+  res.json(activity);
 });
 
 // API: List activities
 app.get('/api/activities', requireAuth, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
-  
-  const activities = db.prepare(`
-    SELECT * FROM activities 
-    ORDER BY created_at DESC 
-    LIMIT ? OFFSET ?
-  `).all(limit, offset);
-  
-  res.json(activities);
+  res.json(activities.slice(offset, offset + limit));
 });
 
 // Main page
 app.get('/', requireAuth, (req, res) => {
-  const activities = db.prepare(`
-    SELECT * FROM activities 
-    ORDER BY created_at DESC 
-    LIMIT 100
-  `).all();
-  
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -183,8 +183,6 @@ app.get('/', requireAuth, (req, res) => {
           padding: 40px;
           color: #8b949e;
         }
-        a { color: #58a6ff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
       </style>
     </head>
     <body>
@@ -195,7 +193,7 @@ app.get('/', requireAuth, (req, res) => {
         </header>
         <main>
           ${activities.length === 0 ? '<div class="empty">No activities yet</div>' : ''}
-          ${activities.map(a => `
+          ${activities.slice(0, 100).map(a => `
             <div class="activity">
               <div class="activity-content">${escapeHtml(a.content)}</div>
               <div class="activity-meta">
@@ -212,11 +210,11 @@ app.get('/', requireAuth, (req, res) => {
 });
 
 function escapeHtml(str) {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function formatTime(dateStr) {
-  const date = new Date(dateStr + 'Z');
+  const date = new Date(dateStr);
   const now = new Date();
   const diffMs = now - date;
   const diffMins = Math.floor(diffMs / 60000);
