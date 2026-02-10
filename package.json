@@ -1,0 +1,16 @@
+{
+  "name": "dexo-activity",
+  "version": "1.0.0",
+  "description": "Dexo's activity log",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "Dexo <mail@dexo.bot>",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "express": "^4.18.2"
+  }
+}
