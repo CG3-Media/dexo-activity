@@ -112,10 +112,16 @@ app.get('/api/activities', requireAuth, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   const search = (req.query.q || '').toLowerCase();
+  const date = req.query.date || '';
   
   let filtered = activities;
+  
+  if (date) {
+    filtered = filtered.filter(a => getDateStr(a.created_at) === date);
+  }
+  
   if (search) {
-    filtered = activities.filter(a => 
+    filtered = filtered.filter(a => 
       a.content.toLowerCase().includes(search) || 
       a.category.toLowerCase().includes(search)
     );
@@ -124,14 +130,53 @@ app.get('/api/activities', requireAuth, (req, res) => {
   res.json(filtered.slice(offset, offset + limit));
 });
 
+// Get unique dates from activities
+function getUniqueDates() {
+  const dates = new Set();
+  activities.forEach(a => {
+    dates.add(getDateStr(a.created_at));
+  });
+  return Array.from(dates).sort().reverse();
+}
+
+// Get date string in YYYY-MM-DD format
+function getDateStr(dateStr) {
+  const d = new Date(dateStr);
+  return d.toISOString().split('T')[0];
+}
+
+// Format date for tab label
+function formatDateTab(dateStr) {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  
+  const todayStr = today.toISOString().split('T')[0];
+  const yesterdayStr = yesterday.toISOString().split('T')[0];
+  
+  if (dateStr === todayStr) return 'Today';
+  if (dateStr === yesterdayStr) return 'Yesterday';
+  
+  const date = new Date(dateStr + 'T12:00:00');
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
 // Main page
 app.get('/', requireAuth, (req, res) => {
   const search = req.query.q || '';
+  const selectedDate = req.query.date || '';
   const searchLower = search.toLowerCase();
   
+  const uniqueDates = getUniqueDates();
+  
   let filtered = activities;
+  
+  if (selectedDate) {
+    filtered = filtered.filter(a => getDateStr(a.created_at) === selectedDate);
+  }
+  
   if (search) {
-    filtered = activities.filter(a => 
+    filtered = filtered.filter(a => 
       a.content.toLowerCase().includes(searchLower) || 
       a.category.toLowerCase().includes(searchLower)
     );
@@ -196,6 +241,52 @@ app.get('/', requireAuth, (req, res) => {
         .search-box input::placeholder {
           color: #6e7681;
         }
+        .date-tabs {
+          display: flex;
+          gap: 8px;
+          margin-top: 16px;
+          overflow-x: auto;
+          padding-bottom: 4px;
+          -webkit-overflow-scrolling: touch;
+        }
+        .date-tabs::-webkit-scrollbar {
+          height: 4px;
+        }
+        .date-tabs::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .date-tabs::-webkit-scrollbar-thumb {
+          background: #30363d;
+          border-radius: 2px;
+        }
+        .date-tab {
+          padding: 6px 14px;
+          border-radius: 20px;
+          background: #21262d;
+          color: #8b949e;
+          text-decoration: none;
+          font-size: 0.85rem;
+          white-space: nowrap;
+          transition: all 0.15s;
+          border: 1px solid transparent;
+        }
+        .date-tab:hover {
+          background: #30363d;
+          color: #c9d1d9;
+        }
+        .date-tab.active {
+          background: #58a6ff;
+          color: #0d1117;
+          font-weight: 500;
+        }
+        .date-tab.all {
+          border: 1px solid #30363d;
+          background: transparent;
+        }
+        .date-tab.all.active {
+          background: #58a6ff;
+          border-color: #58a6ff;
+        }
         .activity {
           padding: 16px 0;
           border-bottom: 1px solid #21262d;
@@ -245,12 +336,19 @@ app.get('/', requireAuth, (req, res) => {
           <div class="search-box">
             <form method="GET" action="/">
               <input type="text" name="q" placeholder="Search activities..." value="${escapeHtml(search)}" autocomplete="off">
+              ${selectedDate ? `<input type="hidden" name="date" value="${escapeHtml(selectedDate)}">` : ''}
             </form>
+          </div>
+          <div class="date-tabs">
+            <a href="/${search ? '?q=' + encodeURIComponent(search) : ''}" class="date-tab all ${!selectedDate ? 'active' : ''}">All</a>
+            ${uniqueDates.slice(0, 14).map(d => `
+              <a href="/?date=${d}${search ? '&q=' + encodeURIComponent(search) : ''}" class="date-tab ${selectedDate === d ? 'active' : ''}">${formatDateTab(d)}</a>
+            `).join('')}
           </div>
         </header>
         <main>
           ${search ? `<div class="search-results">${filtered.length} result${filtered.length !== 1 ? 's' : ''} for "${escapeHtml(search)}"</div>` : ''}
-          ${filtered.length === 0 ? '<div class="empty">' + (search ? 'No matching activities' : 'No activities yet') + '</div>' : ''}
+          ${filtered.length === 0 ? '<div class="empty">' + (search ? 'No matching activities' : (selectedDate ? 'No activities on this day' : 'No activities yet')) + '</div>' : ''}
           ${filtered.slice(0, 100).map(a => `
             <div class="activity">
               <div class="activity-content">${highlightSearch(escapeHtml(a.content), search)}</div>
