@@ -1,27 +1,36 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const APP_TOKEN = process.env.APP_TOKEN;
-const DATA_FILE = process.env.DATA_FILE || './activities.json';
 
-// Load activities from file
-function loadActivities() {
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Initialize database
+async function initDb() {
+  const client = await pool.connect();
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
-  } catch (e) {}
-  return [];
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS activity_logs (
+        id BIGSERIAL PRIMARY KEY,
+        content TEXT NOT NULL,
+        category VARCHAR(50) DEFAULT 'general',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_activity_logs_created_at ON activity_logs(created_at DESC)
+    `);
+    console.log('Database initialized');
+  } finally {
+    client.release();
+  }
 }
-
-function saveActivities(activities) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(activities, null, 2));
-}
-
-let activities = loadActivities();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -80,7 +89,7 @@ function requireAuth(req, res, next) {
 }
 
 // API: Add activity
-app.post('/api/activities', (req, res) => {
+app.post('/api/activities', async (req, res) => {
   const authHeader = req.headers.authorization;
   const cookieAuth = req.cookies.app_token === APP_TOKEN;
   const headerAuth = authHeader === `Bearer ${APP_TOKEN}`;
@@ -94,55 +103,67 @@ app.post('/api/activities', (req, res) => {
     return res.status(400).json({ error: 'Content required' });
   }
   
-  const activity = {
-    id: Date.now(),
-    content,
-    category: category || 'general',
-    created_at: new Date().toISOString()
-  };
-  
-  activities.unshift(activity);
-  saveActivities(activities);
-  
-  res.json(activity);
+  try {
+    const result = await pool.query(
+      'INSERT INTO activity_logs (content, category) VALUES ($1, $2) RETURNING *',
+      [content, category || 'general']
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Insert error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // API: List activities
-app.get('/api/activities', requireAuth, (req, res) => {
+app.get('/api/activities', requireAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
-  const search = (req.query.q || '').toLowerCase();
+  const search = req.query.q || '';
   const date = req.query.date || '';
   
-  let filtered = activities;
-  
-  if (date) {
-    filtered = filtered.filter(a => getDateStr(a.created_at) === date);
+  try {
+    let query = 'SELECT * FROM activity_logs WHERE 1=1';
+    const params = [];
+    let paramIndex = 1;
+    
+    if (date) {
+      query += ` AND DATE(created_at AT TIME ZONE 'America/Los_Angeles') = $${paramIndex}`;
+      params.push(date);
+      paramIndex++;
+    }
+    
+    if (search) {
+      query += ` AND (content ILIKE $${paramIndex} OR category ILIKE $${paramIndex})`;
+      params.push(`%${search}%`);
+      paramIndex++;
+    }
+    
+    query += ` ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(limit, offset);
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Query error:', err);
+    res.status(500).json({ error: 'Database error' });
   }
-  
-  if (search) {
-    filtered = filtered.filter(a => 
-      a.content.toLowerCase().includes(search) || 
-      a.category.toLowerCase().includes(search)
-    );
-  }
-  
-  res.json(filtered.slice(offset, offset + limit));
 });
 
 // Get unique dates from activities
-function getUniqueDates() {
-  const dates = new Set();
-  activities.forEach(a => {
-    dates.add(getDateStr(a.created_at));
-  });
-  return Array.from(dates).sort().reverse();
-}
-
-// Get date string in YYYY-MM-DD format
-function getDateStr(dateStr) {
-  const d = new Date(dateStr);
-  return d.toISOString().split('T')[0];
+async function getUniqueDates() {
+  try {
+    const result = await pool.query(`
+      SELECT DISTINCT DATE(created_at AT TIME ZONE 'America/Los_Angeles') as date
+      FROM activity_logs
+      ORDER BY date DESC
+      LIMIT 14
+    `);
+    return result.rows.map(r => r.date.toISOString().split('T')[0]);
+  } catch (err) {
+    console.error('Date query error:', err);
+    return [];
+  }
 }
 
 // Format date for tab label
@@ -162,207 +183,219 @@ function formatDateTab(dateStr) {
 }
 
 // Main page
-app.get('/', requireAuth, (req, res) => {
+app.get('/', requireAuth, async (req, res) => {
   const search = req.query.q || '';
   const selectedDate = req.query.date || '';
-  const searchLower = search.toLowerCase();
   
-  const uniqueDates = getUniqueDates();
-  
-  let filtered = activities;
-  
-  if (selectedDate) {
-    filtered = filtered.filter(a => getDateStr(a.created_at) === selectedDate);
-  }
-  
-  if (search) {
-    filtered = filtered.filter(a => 
-      a.content.toLowerCase().includes(searchLower) || 
-      a.category.toLowerCase().includes(searchLower)
-    );
-  }
-  
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Dexo Activity</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <meta name="robots" content="noindex, nofollow">
-      <style>
-        * { box-sizing: border-box; }
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          background: #0d1117;
-          color: #c9d1d9;
-          margin: 0;
-          padding: 0;
-          line-height: 1.5;
-        }
-        .container {
-          max-width: 600px;
-          margin: 0 auto;
-          padding: 20px;
-        }
-        header {
-          border-bottom: 1px solid #21262d;
-          padding-bottom: 16px;
-          margin-bottom: 20px;
-        }
-        header h1 {
-          margin: 0;
-          font-size: 1.5rem;
-          display: flex;
-          align-items: center;
-          gap: 8px;
-        }
-        header p {
-          margin: 4px 0 0;
-          color: #8b949e;
-          font-size: 0.9rem;
-        }
-        .search-box {
-          margin-top: 16px;
-        }
-        .search-box input {
-          width: 100%;
-          padding: 10px 16px;
-          border: 1px solid #30363d;
-          border-radius: 24px;
-          background: #161b22;
-          color: #c9d1d9;
-          font-size: 0.95rem;
-          outline: none;
-          transition: border-color 0.2s;
-        }
-        .search-box input:focus {
-          border-color: #58a6ff;
-        }
-        .search-box input::placeholder {
-          color: #6e7681;
-        }
-        .date-tabs {
-          display: flex;
-          gap: 8px;
-          margin-top: 16px;
-          overflow-x: auto;
-          padding-bottom: 4px;
-          -webkit-overflow-scrolling: touch;
-        }
-        .date-tabs::-webkit-scrollbar {
-          height: 4px;
-        }
-        .date-tabs::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .date-tabs::-webkit-scrollbar-thumb {
-          background: #30363d;
-          border-radius: 2px;
-        }
-        .date-tab {
-          padding: 6px 14px;
-          border-radius: 20px;
-          background: #21262d;
-          color: #8b949e;
-          text-decoration: none;
-          font-size: 0.85rem;
-          white-space: nowrap;
-          transition: all 0.15s;
-          border: 1px solid transparent;
-        }
-        .date-tab:hover {
-          background: #30363d;
-          color: #c9d1d9;
-        }
-        .date-tab.active {
-          background: #58a6ff;
-          color: #0d1117;
-          font-weight: 500;
-        }
-        .date-tab.all {
-          border: 1px solid #30363d;
-          background: transparent;
-        }
-        .date-tab.all.active {
-          background: #58a6ff;
-          border-color: #58a6ff;
-        }
-        .activity {
-          padding: 16px 0;
-          border-bottom: 1px solid #21262d;
-        }
-        .activity:last-child {
-          border-bottom: none;
-        }
-        .activity-content {
-          font-size: 1rem;
-          margin-bottom: 8px;
-        }
-        .activity-meta {
-          font-size: 0.8rem;
-          color: #8b949e;
-          display: flex;
-          gap: 12px;
-        }
-        .category {
-          background: #21262d;
-          padding: 2px 8px;
-          border-radius: 12px;
-          font-size: 0.75rem;
-        }
-        .empty {
-          text-align: center;
-          padding: 40px;
-          color: #8b949e;
-        }
-        .search-results {
-          color: #8b949e;
-          font-size: 0.85rem;
-          margin-bottom: 12px;
-        }
-        mark {
-          background: #634d00;
-          color: #f0e68c;
-          padding: 0 2px;
-          border-radius: 2px;
-        }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <header>
-          <h1>🤖 Dexo Activity</h1>
-          <p>What I've been up to</p>
-          <div class="search-box">
-            <form method="GET" action="/">
-              <input type="text" name="q" placeholder="Search activities..." value="${escapeHtml(search)}" autocomplete="off">
-              ${selectedDate ? `<input type="hidden" name="date" value="${escapeHtml(selectedDate)}">` : ''}
-            </form>
-          </div>
-          <div class="date-tabs">
-            <a href="/${search ? '?q=' + encodeURIComponent(search) : ''}" class="date-tab all ${!selectedDate ? 'active' : ''}">All</a>
-            ${uniqueDates.slice(0, 14).map(d => `
-              <a href="/?date=${d}${search ? '&q=' + encodeURIComponent(search) : ''}" class="date-tab ${selectedDate === d ? 'active' : ''}">${formatDateTab(d)}</a>
-            `).join('')}
-          </div>
-        </header>
-        <main>
-          ${search ? `<div class="search-results">${filtered.length} result${filtered.length !== 1 ? 's' : ''} for "${escapeHtml(search)}"</div>` : ''}
-          ${filtered.length === 0 ? '<div class="empty">' + (search ? 'No matching activities' : (selectedDate ? 'No activities on this day' : 'No activities yet')) + '</div>' : ''}
-          ${filtered.slice(0, 100).map(a => `
-            <div class="activity">
-              <div class="activity-content">${highlightSearch(escapeHtml(a.content), search)}</div>
-              <div class="activity-meta">
-                <span class="category">${escapeHtml(a.category)}</span>
-                <span>${formatTime(a.created_at)}</span>
-              </div>
+  try {
+    const uniqueDates = await getUniqueDates();
+    
+    let query = 'SELECT * FROM activity_logs WHERE 1=1';
+    const params = [];
+    let paramIndex = 1;
+    
+    if (selectedDate) {
+      query += ` AND DATE(created_at AT TIME ZONE 'America/Los_Angeles') = $${paramIndex}`;
+      params.push(selectedDate);
+      paramIndex++;
+    }
+    
+    if (search) {
+      query += ` AND (content ILIKE $${paramIndex} OR category ILIKE $${paramIndex})`;
+      params.push(`%${search}%`);
+      paramIndex++;
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT 100';
+    
+    const result = await pool.query(query, params);
+    const activities = result.rows;
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Dexo Activity</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="robots" content="noindex, nofollow">
+        <style>
+          * { box-sizing: border-box; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            margin: 0;
+            padding: 0;
+            line-height: 1.5;
+          }
+          .container {
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+          }
+          header {
+            border-bottom: 1px solid #21262d;
+            padding-bottom: 16px;
+            margin-bottom: 20px;
+          }
+          header h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+          }
+          header p {
+            margin: 4px 0 0;
+            color: #8b949e;
+            font-size: 0.9rem;
+          }
+          .search-box {
+            margin-top: 16px;
+          }
+          .search-box input {
+            width: 100%;
+            padding: 10px 16px;
+            border: 1px solid #30363d;
+            border-radius: 24px;
+            background: #161b22;
+            color: #c9d1d9;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+          }
+          .search-box input:focus {
+            border-color: #58a6ff;
+          }
+          .search-box input::placeholder {
+            color: #6e7681;
+          }
+          .date-tabs {
+            display: flex;
+            gap: 8px;
+            margin-top: 16px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+            -webkit-overflow-scrolling: touch;
+          }
+          .date-tabs::-webkit-scrollbar {
+            height: 4px;
+          }
+          .date-tabs::-webkit-scrollbar-track {
+            background: transparent;
+          }
+          .date-tabs::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 2px;
+          }
+          .date-tab {
+            padding: 6px 14px;
+            border-radius: 20px;
+            background: #21262d;
+            color: #8b949e;
+            text-decoration: none;
+            font-size: 0.85rem;
+            white-space: nowrap;
+            transition: all 0.15s;
+            border: 1px solid transparent;
+          }
+          .date-tab:hover {
+            background: #30363d;
+            color: #c9d1d9;
+          }
+          .date-tab.active {
+            background: #58a6ff;
+            color: #0d1117;
+            font-weight: 500;
+          }
+          .date-tab.all {
+            border: 1px solid #30363d;
+            background: transparent;
+          }
+          .date-tab.all.active {
+            background: #58a6ff;
+            border-color: #58a6ff;
+          }
+          .activity {
+            padding: 16px 0;
+            border-bottom: 1px solid #21262d;
+          }
+          .activity:last-child {
+            border-bottom: none;
+          }
+          .activity-content {
+            font-size: 1rem;
+            margin-bottom: 8px;
+          }
+          .activity-meta {
+            font-size: 0.8rem;
+            color: #8b949e;
+            display: flex;
+            gap: 12px;
+          }
+          .category {
+            background: #21262d;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+          }
+          .empty {
+            text-align: center;
+            padding: 40px;
+            color: #8b949e;
+          }
+          .search-results {
+            color: #8b949e;
+            font-size: 0.85rem;
+            margin-bottom: 12px;
+          }
+          mark {
+            background: #634d00;
+            color: #f0e68c;
+            padding: 0 2px;
+            border-radius: 2px;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <header>
+            <h1>🤖 Dexo Activity</h1>
+            <p>What I've been up to</p>
+            <div class="search-box">
+              <form method="GET" action="/">
+                <input type="text" name="q" placeholder="Search activities..." value="${escapeHtml(search)}" autocomplete="off">
+                ${selectedDate ? `<input type="hidden" name="date" value="${escapeHtml(selectedDate)}">` : ''}
+              </form>
             </div>
-          `).join('')}
-        </main>
-      </div>
-    </body>
-    </html>
-  `);
+            <div class="date-tabs">
+              <a href="/${search ? '?q=' + encodeURIComponent(search) : ''}" class="date-tab all ${!selectedDate ? 'active' : ''}">All</a>
+              ${uniqueDates.map(d => `
+                <a href="/?date=${d}${search ? '&q=' + encodeURIComponent(search) : ''}" class="date-tab ${selectedDate === d ? 'active' : ''}">${formatDateTab(d)}</a>
+              `).join('')}
+            </div>
+          </header>
+          <main>
+            ${search ? `<div class="search-results">${activities.length} result${activities.length !== 1 ? 's' : ''} for "${escapeHtml(search)}"</div>` : ''}
+            ${activities.length === 0 ? '<div class="empty">' + (search ? 'No matching activities' : (selectedDate ? 'No activities on this day' : 'No activities yet')) + '</div>' : ''}
+            ${activities.map(a => `
+              <div class="activity">
+                <div class="activity-content">${highlightSearch(escapeHtml(a.content), search)}</div>
+                <div class="activity-meta">
+                  <span class="category">${escapeHtml(a.category)}</span>
+                  <span>${formatTime(a.created_at)}</span>
+                </div>
+              </div>
+            `).join('')}
+          </main>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error('Page error:', err);
+    res.status(500).send('Database error');
+  }
 });
 
 function escapeHtml(str) {
@@ -390,6 +423,12 @@ function formatTime(dateStr) {
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-app.listen(PORT, () => {
-  console.log(`Dexo Activity running on port ${PORT}`);
+// Start server
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Dexo Activity running on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error('Failed to initialize database:', err);
+  process.exit(1);
 });
